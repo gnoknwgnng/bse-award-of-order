@@ -32,7 +32,7 @@ jobs:
 
       - name: Run watcher
         env:
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_TOPIC_PREFIX: ${{ secrets.NTFY_TOPIC_PREFIX }}
         run: python watcher.py
 
       - name: Commit updated state

@@ -1,13 +1,22 @@
 """
 BSE Corporate Announcements — Real-time Watcher (GitHub Actions edition)
 --------------------------------------------------------------------------
-Same core logic as before, adapted to run inside a GitHub Actions job:
+Polls BSE's "Company Update" category ONCE per cycle, then fans each new
+announcement out to its OWN ntfy.sh topic based on its subcategory
+(e.g. "Award of Order / Receipt of Order" -> bse-<prefix>-award-of-order...).
+
+This deliberately avoids running one workflow per subcategory: BSE would
+otherwise get hit by N parallel pollers, and GitHub Actions would hit its
+concurrent-job cap. One poller, N topics.
 
   - Runs for a bounded duration (default 5h50m — just under GitHub's 6-hour
     per-job limit), then exits cleanly so the workflow can re-trigger itself.
   - Persists "already seen" announcement IDs to state.json, committed back
     to the repo, so the next chained run doesn't re-alert on old news.
-  - Sends push notifications via ntfy.sh (free, no signup) instead of print.
+  - Sends push notifications via ntfy.sh (free, no signup).
+  - Any subcategory not in subcategories.py still gets alerted — just routed
+    to a shared "uncategorized" topic instead of its own, so nothing is
+    ever silently dropped.
 
 Install once (handled by the workflow's pip install step):
     pip install bse requests
@@ -23,23 +32,25 @@ from bse import BSE
 from bse import constants
 import requests
 
+from subcategories import SUBCATEGORY_SLUGS, FALLBACK_SLUG
+
 # ---------- CONFIG ----------
 POLL_INTERVAL_SECONDS = 3
 RUN_DURATION_MINUTES = 350          # ~5h50m, safely under GitHub's 6h job cap
 STATE_FILE = Path("state.json")
-WATCHLIST_SCRIP_CODES = None        # e.g. ["532540", "500325"], or None for ALL
 
-# Only fetch/alert on this announcement category+subcategory.
-# BSE's exact official subcategory string is "Award of Order / Receipt of Order"
-# filed under the "Company Update" category. Set CATEGORY_FILTER to None to
-# go back to receiving ALL announcement types.
+# Only poll this category; subcategories within it are fanned out to
+# separate topics below. Set to None to fan out ALL categories instead
+# (subcategory names would then need to be unique across categories too).
 CATEGORY_FILTER = constants.CATEGORY.UPDATE
-SUBCATEGORY_FILTER = "Award of Order / Receipt of Order"
 
-# ntfy.sh topic — pick your own unique, hard-to-guess name.
-# Anyone who knows the topic name can read your alerts, so don't use something obvious.
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "bse-alerts-CHANGE-ME-12345")
-NTFY_URL = f"https://ntfy.sh/{NTFY_TOPIC}"
+# ntfy.sh topic PREFIX — pick your own unique, hard-to-guess prefix.
+# Full topic per subcategory = "<prefix>-<subcategory-slug>", e.g.
+# "myprefix123-award-of-order-receipt-of-order".
+# Anyone who knows a topic name can read that topic's alerts, so don't
+# use something guessable.
+NTFY_TOPIC_PREFIX = os.environ.get("NTFY_TOPIC_PREFIX", "bse-alerts-CHANGE-ME-12345")
+NTFY_BASE_URL = "https://ntfy.sh"
 # -----------------------------
 
 
@@ -64,18 +75,27 @@ def pdf_url(item: dict) -> str | None:
     return f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{name}" if name else None
 
 
+def topic_for(item: dict) -> str:
+    subcat = (item.get("SUBCATNAME") or "").strip()
+    slug = SUBCATEGORY_SLUGS.get(subcat, FALLBACK_SLUG)
+    return f"{NTFY_TOPIC_PREFIX}-{slug}"
+
+
 def send_alert(item: dict):
     company = item.get("SLONGNAME")
     scrip = item.get("SCRIP_CD")
     headline = item.get("HEADLINE") or item.get("NEWSSUB")
     category = item.get("CATEGORYNAME")
+    subcategory = item.get("SUBCATNAME")
     more_text = (item.get("MORE") or "").strip()
     dissem = item.get("DissemDT")
     pdf = pdf_url(item)
+    topic = topic_for(item)
+    ntfy_url = f"{NTFY_BASE_URL}/{topic}"
 
     # Console log (visible in the GitHub Actions run log)
-    print(f"\n🔔 {company} ({scrip}) — {headline}")
-    print(f"   {category} | Dissem: {dissem}")
+    print(f"\n🔔 [{topic}] {company} ({scrip}) — {headline}")
+    print(f"   {category} / {subcategory} | Dissem: {dissem}")
     if pdf:
         print(f"   PDF: {pdf}")
 
@@ -89,17 +109,17 @@ def send_alert(item: dict):
 
     try:
         requests.post(
-            NTFY_URL,
+            ntfy_url,
             data=body.encode("utf-8"),
             headers={
-                "Title": f"{company} ({scrip}) — {category}".encode("utf-8"),
+                "Title": f"{company} ({scrip}) — {subcategory}".encode("utf-8"),
                 "Priority": "default",
                 "Tags": "bell",
             },
             timeout=10,
         )
     except Exception as e:
-        print(f"[warn] ntfy push failed: {e}")
+        print(f"[warn] ntfy push failed for topic {topic}: {e}")
 
 
 def run():
@@ -110,6 +130,8 @@ def run():
     deadline = datetime.now() + timedelta(minutes=RUN_DURATION_MINUTES)
     print(f"Starting watcher. Will run until {deadline.isoformat(timespec='seconds')}")
     print(f"Loaded {len(seen_ids)} previously-seen announcement IDs.")
+    print(f"Fanning out to {len(SUBCATEGORY_SLUGS)} known subcategory topics "
+          f"(+ 1 fallback) under prefix '{NTFY_TOPIC_PREFIX}'.")
 
     save_counter = 0
 
@@ -117,17 +139,10 @@ def run():
         while datetime.now() < deadline:
             try:
                 if CATEGORY_FILTER:
-                    data = bse.announcements(
-                        category=CATEGORY_FILTER,
-                        subcategory=SUBCATEGORY_FILTER,
-                    )
+                    data = bse.announcements(category=CATEGORY_FILTER)
                 else:
                     data = bse.announcements()
                 rows = data.get("Table", [])
-
-                if WATCHLIST_SCRIP_CODES:
-                    rows = [r for r in rows if str(r.get("SCRIP_CD")) in WATCHLIST_SCRIP_CODES]
-
                 rows.sort(key=lambda r: r.get("DissemDT") or "")
 
                 for item in rows:
